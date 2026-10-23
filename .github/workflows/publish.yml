@@ -1,0 +1,97 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  plugin-check:
+    uses: ./.github/workflows/plugin-check.yml
+
+  publish:
+    needs: [plugin-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify tag matches package version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+          echo "Publishing dsh-client-auto-continue@$version from $GITHUB_REF_NAME"
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Pack tarball
+        run: |
+          mkdir -p dist
+          npm pack --pack-destination dist
+
+      - name: Package release archive
+        run: |
+          version=$(node -p "require('./package.json').version")
+          dir="dsh-client-auto-continue-${version}"
+          mkdir -p "dist/${dir}"
+          cp lib/client.js lib/client.js.map lib/index.js "dist/${dir}/"
+          cd dist
+          zip -q -r "${dir}.zip" "${dir}"
+          rm -rf "${dir}"
+          echo "archive=${dir}.zip" >> "$GITHUB_ENV"
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Set up Node.js for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: '@hsiangnianian'
+
+      - name: Publish to GitHub Packages
+        run: |
+          node scripts/prepare-github-package.mjs
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+
+      - name: Create GitHub Release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if git describe --tags --abbrev=0 HEAD^ >/dev/null 2>&1; then
+            notes=$(git log --oneline --no-decorate "$(git describe --tags --abbrev=0 HEAD^)..HEAD")
+          else
+            notes=$(git log --oneline --no-decorate -10)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tgz \
+            "dist/${archive}" \
+            --title "dsh-auto-continue v$version" \
+            --notes "$notes"
